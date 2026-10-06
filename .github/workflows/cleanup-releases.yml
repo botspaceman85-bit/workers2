@@ -1,0 +1,48 @@
+name: Cleanup Old Releases
+
+on:
+  schedule:
+    # Jalan tiap jam 00:00 UTC
+    - cron: "0 0 * * *"
+  workflow_dispatch:
+
+jobs:
+  cleanup:
+    name: Delete stale pre-releases
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+
+    steps:
+      - name: Delete pre-releases older than 2 hours
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const releases = await github.rest.repos.listReleases({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              per_page: 100,
+            });
+            const cutoff = Date.now() - 2 * 60 * 60 * 1000; // 2 jam
+            for (const rel of releases.data) {
+              if (rel.prerelease && new Date(rel.created_at).getTime() < cutoff) {
+                console.log(`Deleting release: ${rel.tag_name} (${rel.created_at})`);
+                try {
+                  await github.rest.repos.deleteRelease({
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    release_id: rel.id,
+                  });
+                  await github.rest.git.deleteRef({
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    ref: `tags/${rel.tag_name}`,
+                  }).catch(() => {});
+                } catch (e) {
+                  console.log(`Gagal hapus ${rel.tag_name}: ${e.message}`);
+                }
+              }
+            }
+            console.log('Cleanup done.');
