@@ -1,0 +1,170 @@
+name: Build Flutter APK
+
+on:
+  workflow_dispatch:
+    inputs:
+      jobId:
+        description: "Unique build ID"
+        required: true
+        type: string
+      userId:
+        description: "Telegram user ID"
+        required: false
+        default: "0"
+        type: string
+      payload:
+        description: "JSON payload from the bot"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: flutter-build-${{ inputs.jobId }}
+  cancel-in-progress: false
+
+env:
+  JOB_ID: ${{ inputs.jobId }}
+  GH_TOKEN: ${{ github.token }}
+  PUB_CACHE: ${{ github.workspace }}/.pub-cache
+  CI: "true"
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout worker
+        uses: actions/checkout@v4
+
+      - name: Parse payload
+        id: payload
+        env:
+          PAYLOAD: ${{ inputs.payload }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, os
+          p=json.loads(os.environ['PAYLOAD'])
+          print("mode="+str(p.get("mode","zip")))
+          print("url="+str(p.get("url","")))
+          print("build_type="+str(p.get("buildType","release")))
+          print("requested_flutter="+str(p.get("flutterVersion","")))
+          PY
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import json, os
+          p=json.loads(os.environ['PAYLOAD'])
+          def put(k,v):
+              v=str(v).replace("%","%25").replace("\r","%0D").replace("\n","%0A")
+              print(f"{k}={v}")
+          put("mode",p.get("mode","zip"))
+          put("url",p.get("url",""))
+          put("build_type",p.get("buildType","release"))
+          put("requested_flutter",p.get("flutterVersion",""))
+          PY
+
+      - name: Download source ZIP
+        if: steps.payload.outputs.mode == 'zip'
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "${{ steps.payload.outputs.url }}" || { echo "Source URL kosong"; exit 1; }
+          mkdir -p project
+          curl --fail --location --retry 5 --retry-delay 3 \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "Accept: application/octet-stream" \
+            "${{ steps.payload.outputs.url }}" -o /tmp/source.zip
+          unzip -q /tmp/source.zip -d /tmp/source
+          bash scripts/flatten-project.sh /tmp/source project
+
+      - name: Reject invalid mode
+        if: steps.payload.outputs.mode != 'zip'
+        shell: bash
+        run: |
+          echo "build-flutter.yml hanya menerima mode=zip. Web2APK memakai build-android.yml."
+          exit 1
+
+      - name: Detect Flutter and Java versions
+        id: versions
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash scripts/select-flutter.sh project "${{ steps.payload.outputs.requested_flutter }}" | tee /tmp/versions.env
+          source /tmp/versions.env
+          echo "flutter_version=$FLUTTER_VERSION" >> "$GITHUB_OUTPUT"
+          echo "flutter_channel=$FLUTTER_CHANNEL" >> "$GITHUB_OUTPUT"
+          echo "java_version=$JAVA_VERSION" >> "$GITHUB_OUTPUT"
+          echo "Selected Flutter: $FLUTTER_VERSION"
+          echo "Selected Java: $JAVA_VERSION"
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ steps.versions.outputs.java_version }}
+          cache: gradle
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ steps.versions.outputs.flutter_version }}
+          channel: ${{ steps.versions.outputs.flutter_channel }}
+          cache: true
+          cache-key: flutter-${{ steps.versions.outputs.flutter_version }}-${{ runner.os }}
+
+      - name: Flutter diagnostics
+        working-directory: project
+        shell: bash
+        run: |
+          set -e
+          flutter --version
+          dart --version
+          flutter doctor -v || true
+          test -f pubspec.yaml || { echo "pubspec.yaml tidak ditemukan"; exit 1; }
+
+      - name: Prepare Android compatibility
+        working-directory: project
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash "$GITHUB_WORKSPACE/scripts/prepare-android.sh" .
+
+      - name: Get dependencies
+        working-directory: project
+        shell: bash
+        run: |
+          set -euo pipefail
+          flutter pub get
+
+      - name: Build APK
+        working-directory: project
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${{ steps.payload.outputs.build_type }}" = "debug" ]; then
+            flutter build apk --debug --no-tree-shake-icons
+          else
+            flutter build apk --release --no-tree-shake-icons
+          fi
+
+      - name: Collect APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p artifact
+          found="$(find project/build/app/outputs/apk -type f -name '*.apk' | head -n 1 || true)"
+          test -n "$found" || { echo "APK tidak ditemukan"; find project/build -maxdepth 5 -type f | head -200; exit 1; }
+          cp "$found" "artifact/${JOB_ID}.apk"
+          ls -lh artifact
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: apk-${{ inputs.jobId }}
+          path: artifact/${{ inputs.jobId }}.apk
+          if-no-files-found: error
+          retention-days: 1
