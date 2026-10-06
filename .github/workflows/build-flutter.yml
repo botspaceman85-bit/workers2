@@ -1,0 +1,236 @@
+name: Build Flutter APK
+
+on:
+  workflow_dispatch:
+    inputs:
+      jobId:
+        description: "Job ID dari bot"
+        required: true
+        type: string
+      userId:
+        description: "User ID Telegram"
+        required: true
+        type: string
+      payload:
+        description: "JSON payload (url, tag, appName, dll)"
+        required: true
+        type: string
+
+concurrency:
+  group: build-${{ github.event.inputs.jobId }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  actions: write
+
+jobs:
+  build:
+    name: "Build APK [job=${{ github.event.inputs.jobId }}]"
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      # ── 1. Parse payload ──────────────────────────────────────────────────
+      - name: Parse payload
+        id: parse
+        run: |
+          PAYLOAD='${{ github.event.inputs.payload }}'
+          echo "SOURCE_URL=$(echo "$PAYLOAD"  | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('url',''))")"       >> $GITHUB_OUTPUT
+          echo "TAG=$(echo "$PAYLOAD"         | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('tag','build'))")"   >> $GITHUB_OUTPUT
+          echo "APP_NAME=$(echo "$PAYLOAD"    | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('appName',''))")"    >> $GITHUB_OUTPUT
+          echo "DOMAIN=$(echo "$PAYLOAD"      | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('domain',''))")"     >> $GITHUB_OUTPUT
+          echo "COLOR=$(echo "$PAYLOAD"       | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('color',''))")"      >> $GITHUB_OUTPUT
+          echo "ICON_URL=$(echo "$PAYLOAD"    | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('iconUrl',''))")"    >> $GITHUB_OUTPUT
+          echo "BUILD_TYPE=$(echo "$PAYLOAD"  | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('buildType','release'))")" >> $GITHUB_OUTPUT
+
+      # ── 2. Setup Java (cached by runner) ─────────────────────────────────
+      - name: Setup Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      # ── 3. Setup Flutter with full cache ─────────────────────────────────
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: "3.24.5"
+          channel: stable
+          cache: true
+          cache-key: flutter-3.24.5-stable
+
+      # ── 4. Download source ZIP ────────────────────────────────────────────
+      - name: Download source ZIP
+        id: dlzip
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SOURCE_URL: ${{ steps.parse.outputs.SOURCE_URL }}
+        run: |
+          echo "Downloading: $SOURCE_URL"
+
+          HTTP_CODE=$(curl -fsSL \
+            -H "Authorization: token $GH_TOKEN" \
+            -H "Accept: application/octet-stream" \
+            -o /tmp/project.zip \
+            -w "%{http_code}" \
+            --retry 5 \
+            --retry-delay 2 \
+            --retry-max-time 60 \
+            --connect-timeout 15 \
+            --max-time 120 \
+            "$SOURCE_URL" || echo "000")
+
+          FILE_SIZE=$(stat -c%s /tmp/project.zip 2>/dev/null || echo 0)
+          echo "HTTP: $HTTP_CODE | Size: ${FILE_SIZE} bytes"
+
+          if [ "$FILE_SIZE" -lt 1000 ]; then
+            echo "Retry tanpa auth..."
+            curl -fsSL \
+              -o /tmp/project.zip \
+              --retry 5 \
+              --retry-delay 2 \
+              --connect-timeout 15 \
+              --max-time 120 \
+              "$SOURCE_URL"
+            FILE_SIZE=$(stat -c%s /tmp/project.zip 2>/dev/null || echo 0)
+          fi
+
+          if [ "$FILE_SIZE" -lt 1000 ]; then
+            echo "ERROR: ZIP tidak valid (size: ${FILE_SIZE})"
+            cat /tmp/project.zip
+            exit 1
+          fi
+
+          unzip -q /tmp/project.zip -d /tmp/source
+          rm -f /tmp/project.zip
+
+          PROJ=$(find /tmp/source -name "pubspec.yaml" -not -path "*/.*" | head -1 | xargs -r dirname)
+          if [ -z "$PROJ" ]; then
+            echo "ERROR: pubspec.yaml tidak ditemukan"
+            find /tmp/source -type f | head -20
+            exit 1
+          fi
+
+          echo "PROJECT_DIR=$PROJ" >> $GITHUB_ENV
+          echo "Found: $PROJ"
+
+      # ── 5. Cache pub dependencies ─────────────────────────────────────────
+      - name: Cache pub dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.pub-cache
+          key: pub-${{ hashFiles('**/pubspec.lock') }}
+          restore-keys: |
+            pub-
+
+      # ── 6. Cache Gradle ───────────────────────────────────────────────────
+      - name: Cache Gradle
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-${{ hashFiles('**/*.gradle*', '**/gradle-wrapper.properties') }}
+          restore-keys: |
+            gradle-
+
+      # ── 7. Patch appName ──────────────────────────────────────────────────
+      - name: Patch App Name
+        if: ${{ steps.parse.outputs.APP_NAME != '' }}
+        run: |
+          APP="${{ steps.parse.outputs.APP_NAME }}"
+          find "$PROJECT_DIR" -name "strings.xml" -exec \
+            sed -i "s|<string name=\"app_name\">.*</string>|<string name=\"app_name\">${APP}</string>|g" {} + 2>/dev/null || true
+          sed -i "s|android:label=\"[^\"]*\"|android:label=\"${APP}\"|g" \
+            "$PROJECT_DIR/android/app/src/main/AndroidManifest.xml" 2>/dev/null || true
+
+      # ── 8. Patch Domain ───────────────────────────────────────────────────
+      - name: Patch Domain
+        if: ${{ steps.parse.outputs.DOMAIN != '' }}
+        run: |
+          DOMAIN="${{ steps.parse.outputs.DOMAIN }}"
+          find "$PROJECT_DIR/lib" -name "*.dart" -exec \
+            sed -i "s|https\?://[a-zA-Z0-9._:/?#&=%-]*|${DOMAIN}|g" {} + 2>/dev/null || true
+
+      # ── 9. Patch Icon ─────────────────────────────────────────────────────
+      - name: Patch App Icon
+        if: ${{ steps.parse.outputs.ICON_URL != '' }}
+        run: |
+          ICON_URL="${{ steps.parse.outputs.ICON_URL }}"
+          ICON_PATH="$PROJECT_DIR/android/app/src/main/res"
+          curl -fsSL -o /tmp/ic_src.png "$ICON_URL" || true
+          for dir in mipmap-hdpi mipmap-mdpi mipmap-xhdpi mipmap-xxhdpi mipmap-xxxhdpi; do
+            mkdir -p "$ICON_PATH/$dir"
+            cp /tmp/ic_src.png "$ICON_PATH/$dir/ic_launcher.png" 2>/dev/null || true
+            cp /tmp/ic_src.png "$ICON_PATH/$dir/ic_launcher_round.png" 2>/dev/null || true
+          done
+
+      # ── 10. Flutter pub get (parallel resolver) ───────────────────────────
+      - name: Flutter pub get
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          flutter pub get --no-precompile 2>&1 | tee /tmp/pubget.log
+          if [ ${PIPESTATUS[0]} -ne 0 ]; then
+            cat /tmp/pubget.log
+            exit 1
+          fi
+
+      # ── 11. Build APK ─────────────────────────────────────────────────────
+      - name: Build APK
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          BUILD_TYPE="${{ steps.parse.outputs.BUILD_TYPE }}"
+          if [ "$BUILD_TYPE" = "debug" ]; then
+            flutter build apk --debug \
+              --no-pub \
+              2>&1 | tee /tmp/build.log
+          else
+            flutter build apk --release \
+              --no-pub \
+              --split-debug-info=/tmp/dbg \
+              --obfuscate \
+              2>&1 | tee /tmp/build.log
+          fi
+          if [ ${PIPESTATUS[0]} -ne 0 ]; then
+            tail -60 /tmp/build.log
+            exit 1
+          fi
+
+      # ── 12. Find & rename APK ─────────────────────────────────────────────
+      - name: Find APK
+        id: findapk
+        run: |
+          APK=$(find "$PROJECT_DIR/build/app/outputs" -name "*.apk" | head -1)
+          if [ -z "$APK" ]; then
+            echo "ERROR: APK tidak ditemukan"
+            find "$PROJECT_DIR/build" -type f 2>/dev/null | head -20
+            exit 1
+          fi
+          DEST="/tmp/result-${{ github.event.inputs.jobId }}.apk"
+          cp "$APK" "$DEST"
+          echo "APK_PATH=$DEST" >> $GITHUB_OUTPUT
+          echo "APK: $APK -> $DEST"
+
+      # ── 13. Upload artifact ───────────────────────────────────────────────
+      - name: Upload APK Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: apk-${{ github.event.inputs.jobId }}
+          path: ${{ steps.findapk.outputs.APK_PATH }}
+          retention-days: 1
+          compression-level: 0
+          if-no-files-found: error
+
+      # ── 14. Upload log on failure ─────────────────────────────────────────
+      - name: Upload Build Log (on failure)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: log-${{ github.event.inputs.jobId }}
+          path: |
+            /tmp/build.log
+            /tmp/pubget.log
+          retention-days: 1
+          if-no-files-found: warn
